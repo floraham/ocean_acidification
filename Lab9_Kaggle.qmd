@@ -1,0 +1,381 @@
+---
+title: "Lab_9kaggle_comp"
+format: html
+editor: visual
+---
+
+Load relevant libraries!
+
+```{r}
+library(tidyverse)
+library(corrplot)
+library(tidymodels)
+library(patchwork)
+library(xgboost) 
+library(vip)
+library(dplyr)
+library(yardstick)
+library(kableExtra)
+library(here)
+```
+
+Read data
+
+```{r}
+train <- read.csv(here("train.csv")) %>% janitor::clean_names() %>%  
+#  select(-c("x", "lat_dec", "lon_dec")) %>%  #dropping x  beecause I see it's an entire column of NULL values
+  select(-c("x"))
+
+final_test <- read.csv(here("test.csv")) %>% janitor::clean_names() #%>%  select(-c("lat_dec", "lon_dec"))
+
+```
+
+### Acquire domain knowledge. (Dr. Satterthwaite's presentation)
+
+https://www.sciencedirect.com/topics/earth-and-planetary-sciences/dissolved-inorganic-carbon#:\~:text=Dissolved%20inorganic%20carbon%20(DIC)%20is,form%20of%20C%20in%20water.
+
+# About the Data
+
+This dataset was downloaded from the CalCOFI data portal. Bottle and cast data was downloaded and merged, then relevant variables were selected. I will use the data contained in the train.csv file to train a model that will **predict dissolved inorganic carbon (DIC) content** in the water samples.
+
+Files train.csv - the training set test.csv - the test set
+
+Columns A database description is available here: https://calcofi.org/data/oceanographic-data/bottle-database/
+
+# Explore the Data
+
+Check variable names
+
+```{r}
+# it looks like ta1_x is not named the same in training and testing datasets, let's fix this. Changing ta1_x to ta1 in the training dataset. 
+
+train <- train %>% rename(ta1 = ta1_x)
+```
+
+# Dataset Variables Key
+
+Key: https://calcofi.org/data/oceanographic-data/bottle-database/
+
+lat_dec - Latitude North (Degrees N)
+
+lon_dec - Longitude in (-180 - 180 Degrees E or W)
+
+no2u_m - Micromoles nitrite per liter of seawater
+
+no3u_m - Micromoles nitrate per liter of seawater
+
+nh3u_m - Micromoles ammonia per liter of seawater
+
+r_temp - Reported (Potential) temperature in degrees (°C)
+
+r_depth - Reported Depth (from pressure) in meters (m)
+
+r_sal - Reported Salinity (from Specific Volume anomoly, (M\^3/Kg)
+
+r_dynht - Reported Dynamic Height in units of dynamic meters (work per unit mass)
+
+r_nuts - Reported ammonium concentration
+
+r_oxy_micromol_kg - Reported Oxygen micro-moles/kilogram
+
+po4u_m - Micro-moles Phosphate per liter of seawater
+
+si_o3u_m- Micro-moles Silicate per liter of seawater
+
+ta1_x - Total Alkalinity micro-moles per kilogram solution
+
+salinity1 - Salinity
+
+temperature_deg_c Temperature in Celsius (°C)
+
+dic - Dissolved inorganic carbon (Outcome)
+
+Check out the distributions for all the variables...
+
+```{r}
+skimr::skim(train)
+```
+
+And then check out the distribution of DIC specifically, since that is the variable we're trying to predict. It looks slightly bimodal with peaks around 2000 and 2250.
+
+```{r}
+#check out distribution of outcome variable DIC
+ggplot(data = train, aes(x = dic)) +
+  geom_histogram() + 
+  theme_bw() + labs(title = "Histogram of DIC values")
+```
+
+Check out distributions for other variables as well
+
+```{r warning = FALSE, message = FALSE}
+
+# Get the column names of your dataframe
+column_names <- colnames(train)
+
+# Create an empty list to store histograms
+hist_list <- list()
+
+# Iterate over each column name
+for (col in column_names) {
+  # Create histogram for the current column and add it to the list
+  hist_list[[col]] <- ggplot(data = train, aes(x = .data[[col]])) + 
+    geom_histogram() +
+    theme_bw() + theme(axis.title.y = element_blank())
+}
+
+# Combine histograms into a patchwork layout
+patchwork_layout <- wrap_plots(hist_list, ncol = 3)
+
+# Display the patchwork layout
+patchwork_layout
+```
+
+Let's also see if there are any variables that may have strong correlations. We're still trying to understand our dataset here.
+
+```{r}
+# find some variables that might have correlations 
+# Obtain correlation matrix
+
+corr_mat <- cor(train)
+
+# Make a correlation plot between the variables
+corrplot(corr_mat, method = "shade", shade.col = NA, tl.col = "black", tl.srt = 45, addCoef.col = "black", cl.pos = "n", order = "original", number.cex = 0.7)
+```
+
+**Key observations:**
+
+\- Latitude, longitude, and NO2u_m have weak positive correlation with most other variables.
+
+-   Chemical components like NO2, NO3, NH3, PO4, and SiO3 have varying degrees of correlation with each other and with oceanographic parameters.
+
+\- Oceanographic parameters such as temperature, salinity, and oxygen levels have strong correlations among themselves.
+
+**Specific relationships:**
+
+\- There's a strong negative correlation between NO3 and Temperature (r = -0.933), implying that as temperature increases, the concentration of NO3 decreases.
+
+\- There's a strong positive correlation between NO3 and Depth (r = 0.509), indicating that as depth increases, the concentration of NO3 increases.
+
+**Distribution insights:**
+
+Lots of right skewed data with outliers
+
+-   I can't use a classification algorithm since my prediction variable is continuous.
+
+-   I choose to build an extreme gradient boosted treet (XGBoost) machine learning algorithm to build my ocean acidification prediction model.
+
+    -   I use this algorithm since gradient boosted models, if properly tuned, can be the most flexible and accurate predictive models.
+
+    -   I choose an extreme gradient boosted model since it can handle outliers well and has many hyperparameters that reduce overfitting.
+
+# Deciding what algorithm to use
+
+-   We know that our predictor variable, dissolved inorganic carbon, is a numeric variable as opposed to a categorical variable, so we know that this is a supervised, regression problem that we are solving. Regression algorithms include linear regression, lasso and ridge regression, multivariate regression, and decision trees, to name a few.
+
+-   I know that decision trees are a great "out of the box" algorithm with generally high accuracy. In this course, we also learned about ensemble methods, like XGBoost and random forests.
+
+    **Random Forests vs. XGBoost**
+
+    While Random Forests build multiple decision trees independently and combine their predictions through averaging or voting, XGBoost constructs an ensemble of weak learners sequentially using gradient boosting. Random Forests are known for their robustness and simplicity, often providing good results with minimal tuning and offering relatively easy interpretability due to the independence of decision trees. In contrast, XGBoost tends to offer superior predictive performance, especially for structured/tabular data, by iteratively optimizing a specified loss function and controlling model complexity through regularization techniques. However, XGBoost models are typically more complex and less interpretable compared to Random Forests.
+
+    In the case of this dataset, I think XGBoost may offer the best model since enhancements such as gradient boosting, regularization, and parallelized tree construction can lead to improved performance and flexibility. This dataset includes high dimensional feature space and skewed distributions. I will perform both models (why not!) and pick the best one based on the lowest Root Mean Squared Error (RMSE), though I suspect XGBoost will probably take the winning model. I will use our textbook's procedure on Random Forests and XGBoost models.
+
+    > Gradient boosting machines (GBMs) are an extremely popular machine learning algorithm that have proven successful across many domains and is **one of the leading methods for winning Kaggle competitions.** Whereas random forests (Chapter [11](https://bradleyboehmke.github.io/HOML/random-forest.html#random-forest)) build an ensemble of deep independent trees, GBMs build an ensemble of shallow trees in sequence with each tree learning and improving on the previous one. Although shallow trees by themselves are rather weak predictive models, they can be "boosted" to produce a powerful "committee" that, when appropriately tuned, is often hard to beat with other algorithms. -- Chapter 12 (Gradient Boosting), Hands on Machine Learning with R
+    >
+    > See the textbook, here (https://bradleyboehmke.github.io/HOML/gbm.html#xgboost)
+
+Lastly, I did some research on what the most successful algorithms are, generally, in Kaggle. This is an inspiring blogpost and gives more information as to how it works. https://medium.com/\@MrBam44/kaggle-winners-algorithm-xgboost-87819eb300ae
+
+# Split the training data to create validation set
+
+The workflow will involve training the model on the training set and using the validation set to tune hyperparameters and assess model performance. Once we're satisfied with the model's performance on the validation set, then we evaluate its performance on the separate testing set to get an unbiased estimate of how well it will generalize to new, unseen data.
+
+> 🏋🏽 Training data is used to train the model
+>
+> 🔧 Validation data helps in fine-tuning the model and monitoring its performance during training
+>
+> 📊 Test data is used to evaluate its performance
+
+Since we already have training (train.csv) and testing (test.csv) data , we just need to create V-fold cross-validation (also known as k-fold cross-validation) groups, which randomly splits the data into k equal sized. Let's try 5.
+
+# Preprocessing
+
+To process the data for modeling, we will create a Tidymodel recipe to prepare and normalize our data. We are interesting in predicting the outcome variable, Inorganic Carbon in micro-moles (dic).
+
+```{r}
+
+xgb_prep <- recipe(dic~ ., data = train) %>% # could come back and change from "." to specific variables aka drop long and lat 
+#  step_integer(all_nominal()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_scale(all_numeric_predictors())
+```
+
+##### Parameter Tuning
+
+create cross-validation resamples for tuning our model.
+
+```{r}
+set.seed(123)
+
+#Split the data
+v_folds <- vfold_cv(train, strata = "dic", v = 10)
+```
+
+specify engine, mode, set up workflow, and start tuning
+
+```{r}
+
+xgb_learn <- parsnip::boost_tree(
+  trees = 1000,    #suggested to start big! 
+  learn_rate = tune()                          ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+xgb_learn 
+
+
+xgb_grid_learn <- expand.grid(learn_rate = seq(0.0001, 0.3, length.out = 30))
+
+learn_workflow <- workflow() %>%
+  add_model(xgb_learn) %>% 
+  add_formula(dic ~ .)
+
+doParallel::registerDoParallel() # to build trees in parallel
+
+first_tuned <- tune_grid(
+  object = learn_workflow,
+  resamples = v_folds,
+  grid      = xgb_grid_learn,
+  control   = control_grid(verbose = TRUE))
+
+learn_rate_best <- first_tuned %>% tune::select_best(metric = "rmse")
+
+
+##################second tuning process 
+
+tune_trees <- boost_tree(
+  mode = "regression",
+  trees = tune(),
+  learn_rate = learn_rate_best$learn_rate,
+  min_n = tune(), 
+  tree_depth = tune(), 
+  loss_reduction = tune() 
+  ) %>% 
+  set_engine("xgboost")
+
+
+second_tune_wf <- workflow() %>%
+  add_model(tune_trees) %>% 
+  add_formula(dic ~ .)
+
+
+trees_grid <- grid_latin_hypercube(
+  min_n(),
+  tree_depth(),
+  loss_reduction(),
+  trees(), 
+  size = 50
+)
+
+
+doParallel::registerDoParallel() # this function helps to build trees in parallel
+trees_tuned <- tune_grid(
+  object = second_tune_wf,
+  resamples = v_folds,
+  grid      = trees_grid,
+  control   = control_grid(verbose = TRUE))
+
+treesn_best <- trees_tuned %>% tune::select_best(metric = "rmse")
+
+####
+stoch_model <-parsnip::boost_tree(
+  mode = "regression",
+  trees = treesn_best$trees,
+  learn_rate = learn_rate_best$learn_rate,
+  tree_depth = treesn_best$tree_depth,
+  min_n = treesn_best$min_n,
+  loss_reduction = treesn_best$loss_reduction,
+  sample_size = tune(),
+  mtry = tune(),
+  stop_iter = tune()) %>% 
+  set_engine("xgboost")
+
+stoch_params <- parameters(
+  stop_iter(c(5, 50)),
+  sample_size = sample_prop(c(0.4, 0.9)),
+  finalize(mtry(), train))
+
+
+stoch_workflow <- workflow() %>%
+  add_model(stoch_model) %>% 
+  add_formula(dic ~ .)
+
+stoch_grid <- dials::grid_latin_hypercube(stoch_params, size = 50)
+
+stoch_tuned <- tune_grid(
+  object = stoch_workflow,
+  resamples = v_folds,
+  grid      = stoch_grid ,
+  control   = control_grid(verbose = TRUE))
+
+stoch_tuned %>% show_best() ## rmse 5.48 at n = 10 
+stoch_model_best <- stoch_tuned %>% select_best(metric = "rmse") 
+stoch_model_best 
+```
+
+#### Finalize workflow
+
+Now let's finalize our tuneable workflow with these parameter values.
+
+```{r}
+final_model <-parsnip::boost_tree(
+  mode = "regression",
+  trees = treesn_best$trees, 
+  learn_rate = learn_rate_best$learn_rate,
+  tree_depth = treesn_best$tree_depth, 
+  min_n = treesn_best$min_n, 
+  loss_reduction = treesn_best$loss_reduction, 
+  sample_size = stoch_model_best$sample_size,
+  mtry = stoch_model_best$mtry,
+  stop_iter = stoch_model_best$stop_iter
+) %>%  set_engine("xgboost")
+
+final_workflow <- workflow() %>%
+  add_model(final_model) %>% 
+  add_formula(dic ~ .)
+
+```
+
+Instead of tune() placeholders, we now have real values for all the model hyperparameters.
+
+What are the most important parameters for variable importance? We use the package vip:: to evaluate variable importance
+
+```{r}
+final_workflow %>%
+  fit(data = train) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+```
+
+The predictors that are most important in a team winning vs. losing their match are: ...........
+
+Since our data is already pre-split into training and testing sets, and you have already trained and tuned your model using the training set, I can directly use the predict() function to generate predictions on the test set. You don't need to perform another fitting step using final_fit() because you've already trained your model on the training data.
+
+#### Model Fitting
+
+```{r}
+# Fit the final model on the entire training set
+final_fit <- fit(final_workflow, train)
+
+# Predict on the test set
+test_predictions <- predict(final_fit, new_data = final_test)  %>% #get testing prediction
+  bind_cols(final_test) 
+
+test_predictions <- test_predictions %>% rename("DIC"= .pred)
+
+test_predictions
+
+submission_results <- test_predictions %>% select(id, DIC)
+write.csv(submission_results , here("test_predictions.csv"), row.names=FALSE)
+```
